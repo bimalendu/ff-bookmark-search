@@ -19,7 +19,9 @@ Bookmark titles are converted into vectors using a transformer model and stored 
 
 Make sure you have Python 3.8 or newer.
 
-Install required packages:
+Install required packages with uv:
 
-```bash
-pip install streamlit sentence-transformers faiss-cpu
+```uv
+uv init
+uv add streamlit sentence-transformers faiss-cpu
+uv run -- streamlit run app.py

@@ -65,7 +65,7 @@ if query:
     for i, idx in enumerate(I[0]):
         st.markdown(f"**{titles[idx]}**  \n[{urls[idx]}]({urls[idx]})  \n_(Distance: {D[0][i]:.2f})_")
 
-if st.button("🔁 Rebuild Vector Index"):
+if st.button("🔁 Rebuild Database"):
     import shutil
     shutil.rmtree(DATA_DIR, ignore_errors=True)
     st.cache_resource.clear()
