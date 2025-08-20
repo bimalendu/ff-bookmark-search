@@ -18,10 +18,9 @@ Bookmark titles are converted into vectors using a transformer model and stored 
 ## 📦 Dependencies
 
 Make sure you have Python 3.8 or newer.
-
-Install required packages with uv:
+Install uv by following the instructions here: <https://docs.astral.sh/uv/getting-started/installation/>
 
 ```uv
 uv init
-uv add streamlit sentence-transformers faiss-cpu
+uv add streamlit faiss-cpu sentence-transformers scikit-learn matplotlib wordcloud
 uv run -- streamlit run app.py
