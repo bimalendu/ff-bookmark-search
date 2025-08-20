@@ -69,4 +69,4 @@ if st.button("🔁 Rebuild Vector Index"):
     import shutil
     shutil.rmtree(DATA_DIR, ignore_errors=True)
     st.cache_resource.clear()
-    st.experimental_rerun()
+    st.rerun()
