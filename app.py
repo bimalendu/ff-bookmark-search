@@ -1,6 +1,7 @@
 ﻿import os
 import shutil
 import pickle
+import sqlite3
 import numpy as np
 import faiss
 import streamlit as st
@@ -9,31 +10,30 @@ from wordcloud import WordCloud
 from sentence_transformers import SentenceTransformer
 from typing import List, Tuple, Dict, Set, Optional
 
-# Assumed custom module
-# from bookmarks import get_firefox_bookmarks 
-# Mocking the import for standalone functionality if the file is missing
+# Mock import for standalone functionality
 try:
     from bookmarks import get_firefox_bookmarks
 except ImportError:
     def get_firefox_bookmarks():
-        # Mock data for demonstration if module is missing
+        # Fallback mock data
         return [
             {"title": "Streamlit Documentation", "url": "https://docs.streamlit.io"},
-            {"title": "Python SOLID Principles", "url": "https://realpython.com/solid-principles-python/"},
-            {"title": "FAISS Indexing Tutorial", "url": "https://github.com/facebookresearch/faiss"},
-            {"title": "Sentence Transformers", "url": "https://www.sbert.net/"},
-        ] * 5
+            {"title": "Python Performance Optimization", "url": "https://realpython.com/"},
+            {"title": "FAISS Indexing", "url": "https://github.com/facebookresearch/faiss"},
+            {"title": "SQLite vs Pickle", "url": "https://www.sqlite.org/"},
+        ] * 10
 
 # =========================================================
-# 1. CONFIGURATION (Single Source of Truth)
+# 1. CONFIGURATION
 # =========================================================
 class AppConfig:
     DATA_DIR = "data"
     INDEX_FILE = os.path.join(DATA_DIR, "index.faiss")
     META_FILE = os.path.join(DATA_DIR, "meta.pkl")
     EMBED_FILE = os.path.join(DATA_DIR, "embeddings.npy")
-    IGNORED_FILE = os.path.join(DATA_DIR, "ignored.pkl")
+    DB_FILE = os.path.join(DATA_DIR, "app.db")  # New SQLite DB
     MODEL_NAME = "all-MiniLM-L6-v2"
+    
     DEFAULT_RESULTS_LIMIT = 10
     DEFAULT_IGNORED_LIMIT = 5
 
@@ -46,13 +46,44 @@ class AppConfig:
         shutil.rmtree(AppConfig.DATA_DIR, ignore_errors=True)
 
 # =========================================================
-# 2. PERSISTENCE LAYER (SRP: Handling Disk I/O only)
+# 2. PERSISTENCE LAYER (SQLite + FAISS)
 # =========================================================
+class DatabaseHandler:
+    """Handles structured data via SQLite to prevent I/O blocking."""
+    
+    def __init__(self):
+        AppConfig.ensure_data_dir()
+        self.conn = sqlite3.connect(AppConfig.DB_FILE, check_same_thread=False)
+        self._init_tables()
+
+    def _init_tables(self):
+        with self.conn:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS ignored_urls (
+                    url TEXT PRIMARY KEY,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+    def add_ignored(self, url: str):
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO ignored_urls (url) VALUES (?)", (url,))
+
+    def remove_ignored(self, url: str):
+        with self.conn:
+            self.conn.execute("DELETE FROM ignored_urls WHERE url = ?", (url,))
+
+    def load_ignored_set(self) -> Set[str]:
+        """Reads all ignored URLs into a set for fast O(1) lookups in memory."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT url FROM ignored_urls")
+        return {row[0] for row in cursor.fetchall()}
+
 class PersistenceManager:
-    """Handles saving and loading of index, metadata, and ignored lists."""
+    """Handles Vector DB files."""
     
     @staticmethod
-    def save_vector_db(index: faiss.Index, titles: List[str], urls: List[str], embeddings: np.ndarray):
+    def save_vector_data(index: faiss.Index, titles: List[str], urls: List[str], embeddings: np.ndarray):
         AppConfig.ensure_data_dir()
         faiss.write_index(index, AppConfig.INDEX_FILE)
         with open(AppConfig.META_FILE, "wb") as f:
@@ -60,7 +91,7 @@ class PersistenceManager:
         np.save(AppConfig.EMBED_FILE, embeddings)
 
     @staticmethod
-    def load_vector_db() -> Optional[Tuple[faiss.Index, List[str], List[str], np.ndarray]]:
+    def load_vector_data() -> Optional[Tuple[faiss.Index, List[str], List[str], np.ndarray]]:
         required = [AppConfig.INDEX_FILE, AppConfig.META_FILE, AppConfig.EMBED_FILE]
         if not all(os.path.exists(p) for p in required):
             return None
@@ -73,103 +104,114 @@ class PersistenceManager:
         except Exception:
             return None
 
-    @staticmethod
-    def save_ignored(ignored_set: Set[str]):
-        AppConfig.ensure_data_dir()
-        with open(AppConfig.IGNORED_FILE, "wb") as f:
-            pickle.dump(ignored_set, f)
-
-    @staticmethod
-    def load_ignored() -> Set[str]:
-        if not os.path.exists(AppConfig.IGNORED_FILE):
-            return set()
-        try:
-            with open(AppConfig.IGNORED_FILE, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            return set()
-
 # =========================================================
-# 3. CORE LOGIC (SRP: Search, Indexing, and Filtering)
+# 3. CORE LOGIC (Optimized Search Engine)
 # =========================================================
 class SearchEngine:
-    """Encapsulates embedding generation, indexing, and search logic."""
-    
     def __init__(self):
         self.model = SentenceTransformer(AppConfig.MODEL_NAME)
+        self.db_handler = DatabaseHandler()
         self.index = None
         self.titles = []
         self.urls = []
-        self.embeddings = None
         self._initialize_db()
 
     def _initialize_db(self):
-        """Loads DB from disk or creates a new one (Lazy Initialization)."""
-        data = PersistenceManager.load_vector_db()
+        data = PersistenceManager.load_vector_data()
         if data:
-            self.index, self.titles, self.urls, self.embeddings = data
+            self.index, self.titles, self.urls, _ = data
         else:
             self.rebuild_index()
 
     def rebuild_index(self):
-        """Fetches bookmarks and builds the FAISS index."""
         bookmarks = get_firefox_bookmarks()
         if not bookmarks:
-            raise ValueError("No bookmarks found.")
+            self.titles, self.urls = [], []
+            return # Handle empty gracefully
         
         self.titles = [bm["title"] for bm in bookmarks]
         self.urls = [bm["url"] for bm in bookmarks]
-        self.embeddings = self.model.encode(self.titles, convert_to_numpy=True)
+        embeddings = self.model.encode(self.titles, convert_to_numpy=True)
         
-        self.index = faiss.IndexFlatL2(self.embeddings.shape[1])
-        self.index.add(self.embeddings)
+        self.index = faiss.IndexFlatL2(embeddings.shape[1])
+        self.index.add(embeddings)
         
-        PersistenceManager.save_vector_db(self.index, self.titles, self.urls, self.embeddings)
+        PersistenceManager.save_vector_data(self.index, self.titles, self.urls, embeddings)
 
-    def search(self, query: str, ignored_urls: Set[str]) -> List[Tuple[int, float]]:
+    def search_optimized(self, query: str, limit: int, ignored_set: Set[str]) -> List[Tuple[int, float]]:
         """
-        Returns filtered results.
-        Returns: List of (index, distance) tuples.
+        Performs an iterative search to find 'limit' valid results.
+        Instead of loading ALL results, it fetches (limit + buffer) and expands if needed.
         """
-        if not self.index:
+        if not self.index or len(self.titles) == 0:
             return []
 
         query_vec = self.model.encode([query], convert_to_numpy=True)
-        # Search all to ensure we can filter effectively
-        distances, indices = self.index.search(query_vec, len(self.titles))
+        total_items = len(self.titles)
         
-        results = []
-        for i, idx in enumerate(indices[0]):
-            if idx != -1 and idx < len(self.titles):
+        valid_results = []
+        # Optimization: Start with a buffer. If user wants 10, fetch 20.
+        # This handles cases where some top items are ignored.
+        k = min(limit + len(ignored_set) + 10, total_items)
+        
+        while len(valid_results) < limit and k <= total_items:
+            distances, indices = self.index.search(query_vec, k)
+            
+            # Reset valid results to ensure order is correct on re-expansion
+            temp_results = []
+            
+            for i, idx in enumerate(indices[0]):
+                if idx == -1: continue # FAISS padding
+                
                 url = self.urls[idx]
-                if url not in ignored_urls:
-                    results.append((idx, distances[0][i]))
-        return results
+                if url not in ignored_set:
+                    temp_results.append((idx, distances[0][i]))
+            
+            valid_results = temp_results
+            
+            # Break if we have enough, otherwise double K and retry
+            if len(valid_results) >= limit or k == total_items:
+                break
+            
+            # Geometric expansion
+            k = min(k * 2, total_items)
+
+        return valid_results[:limit]
 
     def get_bookmark(self, idx: int) -> Tuple[str, str]:
         return self.titles[idx], self.urls[idx]
 
     def get_title_map(self) -> Dict[str, str]:
-        """Returns a dict mapping URL -> Title."""
         return dict(zip(self.urls, self.titles))
 
+    # Proxy methods for DatabaseHandler
+    def get_ignored_set(self) -> Set[str]:
+        return self.db_handler.load_ignored_set()
+
+    def toggle_ignore(self, url: str, is_currently_ignored: bool):
+        if is_currently_ignored:
+            self.db_handler.remove_ignored(url)
+        else:
+            self.db_handler.add_ignored(url)
+
 # =========================================================
-# 4. PRESENTATION LAYER (UI Rendering)
+# 4. PRESENTATION LAYER
 # =========================================================
 class UIManager:
-    """Handles all Streamlit rendering and state management."""
-    
     def __init__(self, engine: SearchEngine):
         self.engine = engine
         self._init_session_state()
 
     def _init_session_state(self):
+        # We load the ignored set into session state to avoid hitting DB on every tiny re-render
+        if "ignored_cache" not in st.session_state:
+            st.session_state.ignored_cache = self.engine.get_ignored_set()
+            
         if "results_limit" not in st.session_state:
             st.session_state.results_limit = AppConfig.DEFAULT_RESULTS_LIMIT
-        if "ignored_limit" not in st.session_state:
-            st.session_state.ignored_limit = AppConfig.DEFAULT_IGNORED_LIMIT
-        if "ignored_urls" not in st.session_state:
-            st.session_state.ignored_urls = PersistenceManager.load_ignored()
+            
+        if "ignored_list_limit" not in st.session_state:
+            st.session_state.ignored_list_limit = AppConfig.DEFAULT_IGNORED_LIMIT
 
     def _render_wordcloud(self, titles: List[str], header: str):
         st.subheader(f"📘 {header}")
@@ -185,13 +227,17 @@ class UIManager:
         st.pyplot(fig)
 
     def _handle_toggle(self, url: str):
-        """Callback for ignore toggle."""
-        ignored = st.session_state.ignored_urls
-        if url in ignored:
-            ignored.remove(url)
+        """Optimized toggle: Updates DB and Session Cache immediately."""
+        is_ignored = url in st.session_state.ignored_cache
+        
+        # 1. Update Persistence (SQLite)
+        self.engine.toggle_ignore(url, is_ignored)
+        
+        # 2. Update In-Memory Cache (Immediate UI feedback)
+        if is_ignored:
+            st.session_state.ignored_cache.remove(url)
         else:
-            ignored.add(url)
-        PersistenceManager.save_ignored(ignored)
+            st.session_state.ignored_cache.add(url)
 
     def render_sidebar(self):
         with st.sidebar:
@@ -204,49 +250,58 @@ class UIManager:
             
             st.markdown("---")
             st.info(f"Bookmarks Loaded: {len(self.engine.titles)}")
-            st.info(f"Ignored Items: {len(st.session_state.ignored_urls)}")
+            st.info(f"Ignored Items: {len(st.session_state.ignored_cache)}")
 
     def render_search_results(self, query: str):
-        # Fetch results filtered by ignore list
-        results = self.engine.search(query, st.session_state.ignored_urls)
-        total_results = len(results)
+        # Use Optimized Search
+        results = self.engine.search_optimized(
+            query, 
+            # We request slightly more than the limit to determine if "Load More" is needed
+            limit=st.session_state.results_limit + 1, 
+            ignored_set=st.session_state.ignored_cache
+        )
         
-        # Pagination
+        has_more = len(results) > st.session_state.results_limit
         visible_results = results[:st.session_state.results_limit]
 
-        st.subheader(f"Matches ({total_results})")
+        st.subheader(f"Matches")
         
         for idx, dist in visible_results:
             title, url = self.engine.get_bookmark(idx)
+            
             c1, c2 = st.columns([0.85, 0.15])
             with c1:
                 st.markdown(f"**{title}**")
                 st.caption(f"{url} | Score: {dist:.2f}")
             with c2:
-                is_ignored = url in st.session_state.ignored_urls
-                st.toggle("Ignore", value=is_ignored, key=f"tog_{idx}", 
-                          on_change=self._handle_toggle, args=(url,))
+                # Key must be unique per render
+                st.toggle(
+                    "Ignore", 
+                    value=False, # Search results are by definition NOT ignored
+                    key=f"search_tog_{idx}", 
+                    on_change=self._handle_toggle, 
+                    args=(url,)
+                )
             st.divider()
 
         # Load More Button
-        if st.session_state.results_limit < total_results:
+        if has_more:
             if st.button("🔽 Load More Results"):
                 st.session_state.results_limit += 10
                 st.rerun()
 
-        # Visualization Button
         if visible_results and st.button("📊 Visualize These Results"):
             titles = [self.engine.titles[i] for i, _ in visible_results]
             self._render_wordcloud(titles, "Search Context")
 
     def render_ignored_list(self):
-        ignored = list(st.session_state.ignored_urls)
+        ignored = list(st.session_state.ignored_cache)
         if not ignored:
             return
 
         st.markdown("---")
         with st.expander(f"🚫 Ignored Items ({len(ignored)})"):
-            visible_ignored = ignored[:st.session_state.ignored_limit]
+            visible_ignored = ignored[:st.session_state.ignored_list_limit]
             title_map = self.engine.get_title_map()
 
             for url in visible_ignored:
@@ -256,17 +311,22 @@ class UIManager:
                     st.write(f"**{title}**")
                     st.caption(url)
                 with c2:
-                    st.toggle("Ignore", value=True, key=f"ign_{abs(hash(url))}",
-                              on_change=self._handle_toggle, args=(url,))
+                    st.toggle(
+                        "Ignore", 
+                        value=True, # Ignored items are by definition ignored
+                        key=f"ign_{abs(hash(url))}",
+                        on_change=self._handle_toggle, 
+                        args=(url,)
+                    )
                 st.divider()
 
-            if st.session_state.ignored_limit < len(ignored):
+            if len(ignored) > st.session_state.ignored_list_limit:
                 if st.button("🔽 Load More Ignored"):
-                    st.session_state.ignored_limit += 5
+                    st.session_state.ignored_list_limit += 5
                     st.rerun()
 
     def render_main(self):
-        st.title("🔍 Bookmark Smart Search")
+        st.title("🔍 Bookmark Smart Search (Optimized)")
         self.render_sidebar()
         
         query = st.text_input("Search bookmarks...")
@@ -276,11 +336,10 @@ class UIManager:
         self.render_ignored_list()
 
 # =========================================================
-# 5. ORCHESTRATION (Main Application Entry)
+# 5. ORCHESTRATION
 # =========================================================
 @st.cache_resource
 def get_engine():
-    """Singleton-like pattern via Streamlit cache."""
     return SearchEngine()
 
 def main():
@@ -290,8 +349,10 @@ def main():
         ui.render_main()
     except Exception as e:
         st.error(f"Application Error: {e}")
-        if st.button("Reset Application"):
+        # Option to clear cache if things go wrong
+        if st.button("Hard Reset"):
             AppConfig.clear_cache()
+            st.cache_resource.clear()
             st.rerun()
 
 if __name__ == "__main__":
